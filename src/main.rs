@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use iceberg::compaction::CompactionPolicy;
 use iceberg::db::Database;
 use std::path::{Path, PathBuf};
 
@@ -56,6 +57,8 @@ enum Commands {
     Checkout { name: String },
     /// List all branches
     Branches,
+    /// Delete a branch
+    DeleteBranch { name: String },
     /// Diff between two commits
     Diff { commit_a: String, commit_b: String },
     /// Merge a branch into current
@@ -63,6 +66,37 @@ enum Commands {
         branch: String,
         #[arg(short, long)]
         message: Option<String>,
+    },
+    /// Cherry-pick a commit onto the current branch
+    CherryPick {
+        /// Commit ID to cherry-pick
+        commit: String,
+        #[arg(short, long)]
+        message: Option<String>,
+    },
+    /// Create a tag
+    Tag {
+        /// Tag name
+        name: String,
+        /// Commit to tag (default: HEAD)
+        #[arg(long)]
+        commit: Option<String>,
+        /// Tag message
+        #[arg(short, long)]
+        message: Option<String>,
+    },
+    /// List all tags
+    Tags,
+    /// Delete a tag
+    DeleteTag { name: String },
+    /// Run compaction / garbage collection
+    Compact {
+        /// Keep at most N versions (0 = unlimited)
+        #[arg(long, default_value = "0")]
+        max_versions: usize,
+        /// Keep commits at most N days old
+        #[arg(long)]
+        max_age_days: Option<u64>,
     },
     /// Show database statistics
     Stats,
@@ -85,8 +119,23 @@ fn main() {
         Commands::Branch { name } => cmd_branch(&cli.db, &name),
         Commands::Checkout { name } => cmd_checkout(&cli.db, &name),
         Commands::Branches => cmd_branches(&cli.db),
+        Commands::DeleteBranch { name } => cmd_delete_branch(&cli.db, &name),
         Commands::Diff { commit_a, commit_b } => cmd_diff(&cli.db, &commit_a, &commit_b),
         Commands::Merge { branch, message } => cmd_merge(&cli.db, &branch, message.as_deref()),
+        Commands::CherryPick { commit, message } => {
+            cmd_cherry_pick(&cli.db, &commit, message.as_deref())
+        }
+        Commands::Tag {
+            name,
+            commit,
+            message,
+        } => cmd_tag(&cli.db, &name, commit.as_deref(), message.as_deref()),
+        Commands::Tags => cmd_tags(&cli.db),
+        Commands::DeleteTag { name } => cmd_delete_tag(&cli.db, &name),
+        Commands::Compact {
+            max_versions,
+            max_age_days,
+        } => cmd_compact(&cli.db, max_versions, max_age_days),
         Commands::Stats => cmd_stats(&cli.db),
     };
 
@@ -185,6 +234,13 @@ fn cmd_branches(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn cmd_delete_branch(path: &Path, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let db = Database::open(path)?;
+    db.delete_branch(name)?;
+    println!("Deleted branch '{}'", name);
+    Ok(())
+}
+
 fn cmd_diff(path: &Path, a: &str, b: &str) -> Result<(), Box<dyn std::error::Error>> {
     let db = Database::open(path)?;
     let diff = db.diff(a, b)?;
@@ -212,6 +268,75 @@ fn cmd_merge(
     let db = Database::open(path)?;
     let commit = db.merge(branch, msg)?;
     println!("[{}] {}", &commit.id[..8], commit.message);
+    Ok(())
+}
+
+fn cmd_cherry_pick(
+    path: &Path,
+    commit_id: &str,
+    msg: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = Database::open(path)?;
+    let commit = db.cherry_pick(commit_id, msg)?;
+    println!("[{}] {}", &commit.id[..8], commit.message);
+    Ok(())
+}
+
+fn cmd_tag(
+    path: &Path,
+    name: &str,
+    commit: Option<&str>,
+    msg: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = Database::open(path)?;
+    let tag = db.create_tag(name, commit, msg)?;
+    println!("Tagged {} → {}", tag.name, &tag.commit_id[..8]);
+    Ok(())
+}
+
+fn cmd_tags(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let db = Database::open(path)?;
+    let tags = db.tags()?;
+    if tags.is_empty() {
+        println!("(no tags)");
+    } else {
+        for tag in &tags {
+            let msg = tag
+                .message
+                .as_deref()
+                .map(|m| format!(" — {}", m))
+                .unwrap_or_default();
+            println!(
+                "{} → {} {}{}",
+                tag.name,
+                &tag.commit_id[..8],
+                tag.created_at.format("%Y-%m-%d %H:%M:%S"),
+                msg,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cmd_delete_tag(path: &Path, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let db = Database::open(path)?;
+    db.delete_tag(name)?;
+    println!("Deleted tag '{}'", name);
+    Ok(())
+}
+
+fn cmd_compact(
+    path: &Path,
+    max_versions: usize,
+    max_age_days: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = Database::open(path)?;
+    let policy = CompactionPolicy {
+        max_versions,
+        max_age_days,
+    };
+    let result = db.compact(&policy)?;
+    print!("{}", result);
     Ok(())
 }
 

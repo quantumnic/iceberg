@@ -1,16 +1,19 @@
 use crate::block::Block;
 use crate::commit::Commit;
+use crate::compaction::{find_removable_commits, CompactionPolicy, CompactionResult};
 use crate::error::{IcebergError, Result};
 use crate::storage::BlockStore;
+use crate::tag::Tag;
 use crate::tree::{Tree, TreeDiff};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 const REFS_DIR: &str = "refs";
 const TREES_DIR: &str = "trees";
 const COMMITS_DIR: &str = "commits";
+const TAGS_DIR: &str = "tags";
 
 /// The main database: versioned, branching, immutable key-value store.
 pub struct Database {
@@ -35,6 +38,7 @@ impl Database {
         fs::create_dir_all(path.join(TREES_DIR))?;
         fs::create_dir_all(path.join(COMMITS_DIR))?;
         fs::create_dir_all(path.join(REFS_DIR))?;
+        fs::create_dir_all(path.join(TAGS_DIR))?;
         Ok(Self {
             root: path.to_path_buf(),
             store,
@@ -258,6 +262,208 @@ impl Database {
         self.commit_tree(&merged_tree, &msg)
     }
 
+    // ── Tags ──────────────────────────────────────────────────
+
+    /// Create a tag pointing to a specific commit (or current HEAD).
+    pub fn create_tag(
+        &self,
+        name: &str,
+        commit_id: Option<&str>,
+        message: Option<&str>,
+    ) -> Result<Tag> {
+        // Check if tag name already exists
+        if self.load_tag_by_name(name)?.is_some() {
+            return Err(IcebergError::Corruption(format!(
+                "tag already exists: {}",
+                name
+            )));
+        }
+        let cid = match commit_id {
+            Some(id) => {
+                // Verify commit exists
+                self.load_commit(id)?;
+                id.to_string()
+            }
+            None => self.head_commit()?.id,
+        };
+        let tag = Tag::new(name.into(), cid, message.map(String::from));
+        self.save_tag(&tag)?;
+        Ok(tag)
+    }
+
+    /// List all tags.
+    pub fn tags(&self) -> Result<Vec<Tag>> {
+        let dir = self.root.join(TAGS_DIR);
+        let mut tags = Vec::new();
+        if dir.exists() {
+            for entry in fs::read_dir(&dir)? {
+                let entry = entry?;
+                let data = fs::read(entry.path())?;
+                let tag: Tag = serde_json::from_slice(&data)?;
+                tags.push(tag);
+            }
+        }
+        tags.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(tags)
+    }
+
+    /// Get a tag by name.
+    pub fn get_tag(&self, name: &str) -> Result<Tag> {
+        self.load_tag_by_name(name)?
+            .ok_or_else(|| IcebergError::Corruption(format!("tag not found: {}", name)))
+    }
+
+    /// Delete a tag by name.
+    pub fn delete_tag(&self, name: &str) -> Result<()> {
+        let tag = self.get_tag(name)?;
+        let path = self.root.join(TAGS_DIR).join(&tag.id);
+        fs::remove_file(path)?;
+        Ok(())
+    }
+
+    // ── Cherry-pick ───────────────────────────────────────────
+
+    /// Cherry-pick a commit onto the current branch.
+    /// Applies the diff introduced by the given commit.
+    pub fn cherry_pick(&self, commit_id: &str, message: Option<&str>) -> Result<Commit> {
+        let commit = self.load_commit(commit_id)?;
+        let commit_tree = self.load_tree(&commit.tree_root)?;
+
+        // Get the parent tree (empty if no parent)
+        let parent_tree = match &commit.parent {
+            Some(pid) => {
+                let pc = self.load_commit(pid)?;
+                self.load_tree(&pc.tree_root)?
+            }
+            None => Tree::empty(),
+        };
+
+        // Compute the diff introduced by this commit
+        let diff = parent_tree.diff(&commit_tree);
+
+        // Apply the diff to current tree
+        let mut current = self.current_tree().unwrap_or_else(|_| Tree::empty());
+        for key in &diff.added {
+            if let Some(val) = commit_tree.get(key) {
+                current = current.insert(key.clone(), val.clone());
+            }
+        }
+        for key in &diff.modified {
+            if let Some(val) = commit_tree.get(key) {
+                current = current.insert(key.clone(), val.clone());
+            }
+        }
+        for key in &diff.removed {
+            if current.contains_key(key) {
+                current = current.delete(key);
+            }
+        }
+
+        let msg = message
+            .map(String::from)
+            .unwrap_or_else(|| format!("cherry-pick {}", &commit_id[..8.min(commit_id.len())]));
+        self.commit_tree(&current, &msg)
+    }
+
+    // ── Compaction ────────────────────────────────────────────
+
+    /// Run compaction with the given policy on the current branch.
+    /// Removes old commits and unreachable trees/blocks.
+    pub fn compact(&self, policy: &CompactionPolicy) -> Result<CompactionResult> {
+        let now = chrono::Utc::now();
+        let log = self.log()?;
+        let commits_with_ts: Vec<_> = log.iter().map(|c| (c.id.clone(), c.timestamp)).collect();
+
+        let removable = find_removable_commits(&commits_with_ts, policy, now);
+        if removable.is_empty() {
+            return Ok(CompactionResult::default());
+        }
+
+        // Collect all reachable tree roots and block hashes from commits we're keeping
+        let keep_commit_ids: HashSet<_> = log
+            .iter()
+            .map(|c| c.id.clone())
+            .filter(|id| !removable.contains(id))
+            .collect();
+
+        // Also collect from all branches (not just current)
+        let refs = self.load_refs()?;
+        let mut all_reachable_commits = HashSet::new();
+        for cid in refs.branches.values() {
+            let mut current_id = Some(cid.clone());
+            while let Some(id) = current_id {
+                if !all_reachable_commits.insert(id.clone()) {
+                    break; // already visited
+                }
+                if let Ok(c) = self.load_commit(&id) {
+                    current_id = c.parent;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        let mut reachable_trees = HashSet::new();
+        for cid in &all_reachable_commits {
+            if removable.contains(cid) && !keep_commit_ids.contains(cid) {
+                continue;
+            }
+            if let Ok(c) = self.load_commit(cid) {
+                reachable_trees.insert(c.tree_root.clone());
+            }
+        }
+
+        let mut result = CompactionResult::default();
+
+        // Remove commits
+        for cid in &removable {
+            // Only remove if not reachable from other branches
+            if all_reachable_commits.contains(cid) && keep_commit_ids.contains(cid) {
+                continue;
+            }
+            let path = self.root.join(COMMITS_DIR).join(cid);
+            if path.exists() {
+                // Rewrite parent pointer of child commit if needed
+                fs::remove_file(&path)?;
+                result.commits_removed += 1;
+            }
+        }
+
+        // If we removed commits, fix the chain: find the oldest kept commit
+        // and set its parent to None
+        if result.commits_removed > 0 {
+            let kept_commits: Vec<_> = log.iter().filter(|c| !removable.contains(&c.id)).collect();
+            if let Some(oldest_kept) = kept_commits.last() {
+                if let Some(ref parent_id) = oldest_kept.parent {
+                    let parent_path = self.root.join(COMMITS_DIR).join(parent_id);
+                    if !parent_path.exists() {
+                        // Rewrite this commit with parent = None
+                        let mut fixed = (*oldest_kept).clone();
+                        fixed.parent = None;
+                        self.save_commit(&fixed)?;
+                    }
+                }
+            }
+        }
+
+        // Clean up unreachable trees
+        let trees_dir = self.root.join(TREES_DIR);
+        if trees_dir.exists() {
+            for entry in fs::read_dir(&trees_dir)? {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !reachable_trees.contains(&name) {
+                    let size = entry.metadata()?.len();
+                    fs::remove_file(entry.path())?;
+                    result.trees_removed += 1;
+                    result.bytes_reclaimed += size;
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
     // ── Stats ─────────────────────────────────────────────────
 
     /// Database statistics.
@@ -359,6 +565,29 @@ impl Database {
         let data = serde_json::to_vec_pretty(refs)?;
         fs::write(self.refs_path(), data)?;
         Ok(())
+    }
+
+    fn save_tag(&self, tag: &Tag) -> Result<()> {
+        let path = self.root.join(TAGS_DIR).join(&tag.id);
+        let data = serde_json::to_vec_pretty(tag)?;
+        fs::write(path, data)?;
+        Ok(())
+    }
+
+    fn load_tag_by_name(&self, name: &str) -> Result<Option<Tag>> {
+        let dir = self.root.join(TAGS_DIR);
+        if !dir.exists() {
+            return Ok(None);
+        }
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let data = fs::read(entry.path())?;
+            let tag: Tag = serde_json::from_slice(&data)?;
+            if tag.name == name {
+                return Ok(Some(tag));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -497,6 +726,115 @@ mod tests {
         let stats = db.stats().unwrap();
         assert_eq!(stats.key_count, 1);
         assert_eq!(stats.commit_count, 1);
+    }
+
+    #[test]
+    fn create_and_list_tags() {
+        let (_tmp, db) = test_db();
+        let c = db.put("k", b"v".to_vec(), None).unwrap();
+        let tag = db
+            .create_tag("v1.0", Some(&c.id), Some("first release"))
+            .unwrap();
+        assert_eq!(tag.name, "v1.0");
+        assert_eq!(tag.commit_id, c.id);
+
+        let tags = db.tags().unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].name, "v1.0");
+    }
+
+    #[test]
+    fn tag_current_head() {
+        let (_tmp, db) = test_db();
+        db.put("k", b"v".to_vec(), None).unwrap();
+        let tag = db.create_tag("latest", None, None).unwrap();
+        let head = db.head_commit().unwrap();
+        assert_eq!(tag.commit_id, head.id);
+    }
+
+    #[test]
+    fn duplicate_tag_fails() {
+        let (_tmp, db) = test_db();
+        db.put("k", b"v".to_vec(), None).unwrap();
+        db.create_tag("v1", None, None).unwrap();
+        assert!(db.create_tag("v1", None, None).is_err());
+    }
+
+    #[test]
+    fn delete_tag() {
+        let (_tmp, db) = test_db();
+        db.put("k", b"v".to_vec(), None).unwrap();
+        db.create_tag("v1", None, None).unwrap();
+        db.delete_tag("v1").unwrap();
+        assert!(db.tags().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cherry_pick_commit() {
+        let (_tmp, db) = test_db();
+        db.put("shared", b"data".to_vec(), None).unwrap();
+
+        // Create a feature branch with a new key
+        db.create_branch("feature").unwrap();
+        db.checkout("feature").unwrap();
+        let feat_commit = db.put("feat_key", b"feat_val".to_vec(), None).unwrap();
+
+        // Switch back to main and cherry-pick
+        db.checkout("main").unwrap();
+        assert!(db.get("feat_key").is_err());
+
+        db.cherry_pick(&feat_commit.id, Some("picked feature"))
+            .unwrap();
+        assert_eq!(db.get("feat_key").unwrap(), b"feat_val");
+        assert_eq!(db.get("shared").unwrap(), b"data");
+    }
+
+    #[test]
+    fn cherry_pick_delete() {
+        let (_tmp, db) = test_db();
+        db.put("a", b"1".to_vec(), None).unwrap();
+        db.put("b", b"2".to_vec(), None).unwrap();
+
+        db.create_branch("cleanup").unwrap();
+        db.checkout("cleanup").unwrap();
+        let del_commit = db.delete("a", None).unwrap();
+
+        db.checkout("main").unwrap();
+        assert_eq!(db.get("a").unwrap(), b"1"); // still there
+
+        db.cherry_pick(&del_commit.id, None).unwrap();
+        assert!(db.get("a").is_err()); // now gone
+    }
+
+    #[test]
+    fn compact_with_max_versions() {
+        let (_tmp, db) = test_db();
+        for i in 0..5 {
+            db.put("k", format!("v{}", i).into_bytes(), None).unwrap();
+        }
+        assert_eq!(db.log().unwrap().len(), 5);
+
+        let policy = crate::compaction::CompactionPolicy {
+            max_versions: 2,
+            max_age_days: None,
+        };
+        let result = db.compact(&policy).unwrap();
+        assert!(result.commits_removed > 0);
+
+        // Current value should still work
+        assert_eq!(db.get("k").unwrap(), b"v4");
+    }
+
+    #[test]
+    fn compact_no_policy_removes_nothing() {
+        let (_tmp, db) = test_db();
+        db.put("a", b"1".to_vec(), None).unwrap();
+        db.put("b", b"2".to_vec(), None).unwrap();
+
+        let policy = crate::compaction::CompactionPolicy::default();
+        let result = db.compact(&policy).unwrap();
+        assert_eq!(result.commits_removed, 0);
+        assert_eq!(db.log().unwrap().len(), 2);
     }
 
     #[test]
