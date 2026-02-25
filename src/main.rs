@@ -89,6 +89,35 @@ enum Commands {
     Tags,
     /// Delete a tag
     DeleteTag { name: String },
+    /// Rebase current branch onto another branch
+    Rebase {
+        /// Target branch to rebase onto
+        onto: String,
+    },
+    /// Create a secondary index on a JSON field
+    CreateIndex {
+        /// Index name
+        name: String,
+        /// JSON field path (e.g., "city" or "address.country")
+        field: String,
+    },
+    /// Drop a secondary index
+    DropIndex {
+        /// Index name
+        name: String,
+    },
+    /// Query a secondary index
+    QueryIndex {
+        /// Index name
+        name: String,
+        /// Value to search for
+        value: String,
+        /// Use prefix matching
+        #[arg(long)]
+        prefix: bool,
+    },
+    /// List secondary indexes
+    Indexes,
     /// Run compaction / garbage collection
     Compact {
         /// Keep at most N versions (0 = unlimited)
@@ -132,6 +161,15 @@ fn main() {
         } => cmd_tag(&cli.db, &name, commit.as_deref(), message.as_deref()),
         Commands::Tags => cmd_tags(&cli.db),
         Commands::DeleteTag { name } => cmd_delete_tag(&cli.db, &name),
+        Commands::Rebase { onto } => cmd_rebase(&cli.db, &onto),
+        Commands::CreateIndex { name, field } => cmd_create_index(&cli.db, &name, &field),
+        Commands::DropIndex { name } => cmd_drop_index(&cli.db, &name),
+        Commands::QueryIndex {
+            name,
+            value,
+            prefix,
+        } => cmd_query_index(&cli.db, &name, &value, prefix),
+        Commands::Indexes => cmd_indexes(&cli.db),
         Commands::Compact {
             max_versions,
             max_age_days,
@@ -322,6 +360,73 @@ fn cmd_delete_tag(path: &Path, name: &str) -> Result<(), Box<dyn std::error::Err
     let db = Database::open(path)?;
     db.delete_tag(name)?;
     println!("Deleted tag '{}'", name);
+    Ok(())
+}
+
+fn cmd_rebase(path: &Path, onto: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let db = Database::open(path)?;
+    let commits = db.rebase(onto)?;
+    if commits.is_empty() {
+        println!("Nothing to rebase — already up to date.");
+    } else {
+        println!("Rebased {} commit(s) onto '{}':", commits.len(), onto);
+        for c in &commits {
+            println!("  [{}] {}", &c.id[..8], c.message);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_create_index(
+    path: &Path,
+    name: &str,
+    field: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = Database::open(path)?;
+    db.create_index(name, field)?;
+    println!("Created index '{}' on field '{}'", name, field);
+    Ok(())
+}
+
+fn cmd_drop_index(path: &Path, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let db = Database::open(path)?;
+    db.drop_index(name)?;
+    println!("Dropped index '{}'", name);
+    Ok(())
+}
+
+fn cmd_query_index(
+    path: &Path,
+    name: &str,
+    value: &str,
+    prefix: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = Database::open(path)?;
+    let keys = if prefix {
+        db.query_index_prefix(name, value)?
+    } else {
+        db.query_index(name, value)?
+    };
+    if keys.is_empty() {
+        println!("(no matches)");
+    } else {
+        for k in &keys {
+            println!("{}", k);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_indexes(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let db = Database::open(path)?;
+    let indexes = db.list_indexes();
+    if indexes.is_empty() {
+        println!("(no indexes)");
+    } else {
+        for name in &indexes {
+            println!("{}", name);
+        }
+    }
     Ok(())
 }
 

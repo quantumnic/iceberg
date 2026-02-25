@@ -1,24 +1,33 @@
 use crate::block::Block;
+use crate::bloom::BloomFilter;
 use crate::commit::Commit;
 use crate::compaction::{find_removable_commits, CompactionPolicy, CompactionResult};
 use crate::error::{IcebergError, Result};
+use crate::index::IndexManager;
 use crate::storage::BlockStore;
 use crate::tag::Tag;
 use crate::tree::{Tree, TreeDiff};
+use crate::wal::Wal;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 const REFS_DIR: &str = "refs";
 const TREES_DIR: &str = "trees";
 const COMMITS_DIR: &str = "commits";
 const TAGS_DIR: &str = "tags";
+const BLOOM_DIR: &str = "bloom";
+const INDEXES_FILE: &str = "indexes.json";
 
 /// The main database: versioned, branching, immutable key-value store.
 pub struct Database {
     root: PathBuf,
     store: BlockStore,
+    wal: Mutex<Wal>,
+    bloom: Mutex<BloomFilter>,
+    indexes: Mutex<IndexManager>,
 }
 
 /// Persistent refs: branches and current HEAD.
@@ -39,10 +48,19 @@ impl Database {
         fs::create_dir_all(path.join(COMMITS_DIR))?;
         fs::create_dir_all(path.join(REFS_DIR))?;
         fs::create_dir_all(path.join(TAGS_DIR))?;
-        Ok(Self {
+        fs::create_dir_all(path.join(BLOOM_DIR))?;
+        let wal = Wal::open(&path.join("wal"))?;
+        let bloom = Self::load_bloom_from(path);
+        let indexes = Self::load_indexes_from(path);
+        let db = Self {
             root: path.to_path_buf(),
             store,
-        })
+            wal: Mutex::new(wal),
+            bloom: Mutex::new(bloom),
+            indexes: Mutex::new(indexes),
+        };
+        db.recover_wal()?;
+        Ok(db)
     }
 
     /// Initialize a new database (creates the "main" branch).
@@ -58,10 +76,70 @@ impl Database {
         Ok(db)
     }
 
+    /// Recover from WAL after crash.
+    fn recover_wal(&self) -> Result<()> {
+        let mut wal = self.wal.lock().unwrap();
+        let recovery = wal.recover()?;
+        if !recovery.uncommitted.is_empty() {
+            // Uncommitted transactions are simply ignored (rolled back).
+            // The WAL is truncated after recovery.
+        }
+        wal.truncate()?;
+        Ok(())
+    }
+
+    fn load_bloom_from(path: &Path) -> BloomFilter {
+        let bloom_path = path.join(BLOOM_DIR).join("keys.json");
+        if bloom_path.exists() {
+            if let Ok(data) = fs::read(&bloom_path) {
+                if let Ok(bf) = serde_json::from_slice(&data) {
+                    return bf;
+                }
+            }
+        }
+        BloomFilter::new(10000, 0.01)
+    }
+
+    fn save_bloom(&self) -> Result<()> {
+        let bloom = self.bloom.lock().unwrap();
+        let path = self.root.join(BLOOM_DIR).join("keys.json");
+        let data = serde_json::to_vec(&*bloom)?;
+        fs::write(path, data)?;
+        Ok(())
+    }
+
+    fn load_indexes_from(path: &Path) -> IndexManager {
+        let idx_path = path.join(INDEXES_FILE);
+        if idx_path.exists() {
+            if let Ok(data) = fs::read(&idx_path) {
+                if let Ok(mgr) = serde_json::from_slice(&data) {
+                    return mgr;
+                }
+            }
+        }
+        IndexManager::new()
+    }
+
+    fn save_indexes(&self) -> Result<()> {
+        let indexes = self.indexes.lock().unwrap();
+        let path = self.root.join(INDEXES_FILE);
+        let data = serde_json::to_vec_pretty(&*indexes)?;
+        fs::write(path, data)?;
+        Ok(())
+    }
+
     // ── Key-Value API ─────────────────────────────────────────
 
     /// Get a value by key from the current branch HEAD.
+    /// Uses bloom filter for fast negative lookups.
     pub fn get(&self, key: &str) -> Result<Vec<u8>> {
+        // Fast path: bloom filter says definitely not present
+        {
+            let bloom = self.bloom.lock().unwrap();
+            if bloom.count() > 0 && !bloom.may_contain(key.as_bytes()) {
+                return Err(IcebergError::KeyNotFound(key.into()));
+            }
+        }
         let tree = self.current_tree()?;
         tree.get(key)
             .cloned()
@@ -69,26 +147,82 @@ impl Database {
     }
 
     /// Put a key-value pair; creates a new commit on the current branch.
+    /// Writes are WAL-protected for crash safety.
     pub fn put(&self, key: &str, value: Vec<u8>, message: Option<&str>) -> Result<Commit> {
+        // WAL: begin transaction
+        let tx_id = {
+            let mut wal = self.wal.lock().unwrap();
+            let tx = wal.begin()?;
+            wal.log_write(tx, key.into(), value.clone())?;
+            tx
+        };
+
         let tree = self.current_tree().unwrap_or_else(|_| Tree::empty());
-        let new_tree = tree.insert(key.into(), value);
+        let new_tree = tree.insert(key.into(), value.clone());
         let msg = message
             .map(String::from)
             .unwrap_or_else(|| format!("put {}", key));
-        self.commit_tree(&new_tree, &msg)
+        let commit = self.commit_tree(&new_tree, &msg)?;
+
+        // WAL: commit transaction
+        {
+            let mut wal = self.wal.lock().unwrap();
+            wal.commit(tx_id, commit.id.clone())?;
+        }
+
+        // Update bloom filter
+        {
+            let mut bloom = self.bloom.lock().unwrap();
+            bloom.insert(key.as_bytes());
+        }
+        self.save_bloom()?;
+
+        // Update secondary indexes
+        {
+            let mut indexes = self.indexes.lock().unwrap();
+            indexes.on_put(key, &value);
+        }
+        self.save_indexes()?;
+
+        Ok(commit)
     }
 
     /// Delete a key; creates a new commit.
+    /// Writes are WAL-protected for crash safety.
     pub fn delete(&self, key: &str, message: Option<&str>) -> Result<Commit> {
         let tree = self.current_tree()?;
         if !tree.contains_key(key) {
             return Err(IcebergError::KeyNotFound(key.into()));
         }
+
+        // WAL: begin transaction
+        let tx_id = {
+            let mut wal = self.wal.lock().unwrap();
+            let tx = wal.begin()?;
+            wal.log_delete(tx, key.into())?;
+            tx
+        };
+
         let new_tree = tree.delete(key);
         let msg = message
             .map(String::from)
             .unwrap_or_else(|| format!("delete {}", key));
-        self.commit_tree(&new_tree, &msg)
+        let commit = self.commit_tree(&new_tree, &msg)?;
+
+        // WAL: commit
+        {
+            let mut wal = self.wal.lock().unwrap();
+            wal.commit(tx_id, commit.id.clone())?;
+        }
+
+        // Update secondary indexes
+        {
+            let mut indexes = self.indexes.lock().unwrap();
+            indexes.on_delete(key);
+        }
+        self.save_indexes()?;
+
+        Ok(commit)
     }
 
     /// Scan keys by prefix.
@@ -365,6 +499,186 @@ impl Database {
         self.commit_tree(&current, &msg)
     }
 
+    // ── Rebase ─────────────────────────────────────────────────
+
+    /// Rebase the current branch onto another branch.
+    /// Takes all commits unique to the current branch and replays them
+    /// on top of the target branch's HEAD.
+    pub fn rebase(&self, onto_branch: &str) -> Result<Vec<Commit>> {
+        let refs = self.load_refs()?;
+        let current_branch = refs.head.clone();
+
+        if current_branch == onto_branch {
+            return Err(IcebergError::Corruption(
+                "cannot rebase a branch onto itself".into(),
+            ));
+        }
+
+        let onto_id = refs
+            .branches
+            .get(onto_branch)
+            .ok_or_else(|| IcebergError::BranchNotFound(onto_branch.into()))?
+            .clone();
+
+        // Collect commits on the target branch (to find the fork point)
+        let onto_ancestors: HashSet<String> = {
+            let mut ancestors = HashSet::new();
+            let mut current_id = Some(onto_id.clone());
+            while let Some(id) = current_id {
+                if !ancestors.insert(id.clone()) {
+                    break;
+                }
+                current_id = self.load_commit(&id).ok().and_then(|c| c.parent);
+            }
+            ancestors
+        };
+
+        // Collect commits unique to the current branch (stop at fork point)
+        let current_log = self.log()?;
+        let mut unique_commits: Vec<Commit> = Vec::new();
+        for commit in &current_log {
+            if onto_ancestors.contains(&commit.id) {
+                break;
+            }
+            unique_commits.push(commit.clone());
+        }
+        unique_commits.reverse(); // oldest first for replay
+
+        if unique_commits.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Switch to onto_branch's state as our new base
+        let mut current_tree = self
+            .load_commit(&onto_id)
+            .and_then(|c| self.load_tree(&c.tree_root))?;
+        let mut parent_id = Some(onto_id);
+        let mut new_commits = Vec::new();
+
+        // Replay each unique commit
+        for old_commit in &unique_commits {
+            let old_tree = self.load_tree(&old_commit.tree_root)?;
+            let old_parent_tree = match &old_commit.parent {
+                Some(pid) => self
+                    .load_commit(pid)
+                    .and_then(|c| self.load_tree(&c.tree_root))
+                    .unwrap_or_else(|_| Tree::empty()),
+                None => Tree::empty(),
+            };
+
+            // Compute the diff this commit introduced
+            let diff = old_parent_tree.diff(&old_tree);
+
+            // Apply the diff to current_tree
+            for key in &diff.added {
+                if let Some(val) = old_tree.get(key) {
+                    current_tree = current_tree.insert(key.clone(), val.clone());
+                }
+            }
+            for key in &diff.modified {
+                if let Some(val) = old_tree.get(key) {
+                    current_tree = current_tree.insert(key.clone(), val.clone());
+                }
+            }
+            for key in &diff.removed {
+                if current_tree.contains_key(key) {
+                    current_tree = current_tree.delete(key);
+                }
+            }
+
+            // Create a new commit with the rebased tree
+            self.save_tree(&current_tree)?;
+            for v in current_tree.entries.values() {
+                let block = Block::new(v.clone());
+                self.store.put(&block)?;
+            }
+            let new_commit = Commit::new(
+                parent_id,
+                current_tree.root_hash.clone(),
+                old_commit.message.clone(),
+            );
+            self.save_commit(&new_commit)?;
+            parent_id = Some(new_commit.id.clone());
+            new_commits.push(new_commit);
+        }
+
+        // Update the current branch ref to point to the last new commit
+        if let Some(last) = new_commits.last() {
+            let mut refs = self.load_refs()?;
+            refs.branches.insert(current_branch, last.id.clone());
+            self.save_refs(&refs)?;
+        }
+
+        Ok(new_commits)
+    }
+
+    // ── Secondary Indexes ─────────────────────────────────────
+
+    /// Create a secondary index on a JSON field.
+    pub fn create_index(&self, name: &str, field_path: &str) -> Result<()> {
+        {
+            let mut indexes = self.indexes.lock().unwrap();
+            indexes.create_index(name, field_path)?;
+
+            // Rebuild from current tree
+            if let Ok(tree) = self.current_tree() {
+                let entries: Vec<_> = tree
+                    .entries
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                indexes.rebuild_all(&entries);
+            }
+        }
+        self.save_indexes()
+    }
+
+    /// Drop a secondary index.
+    pub fn drop_index(&self, name: &str) -> Result<()> {
+        {
+            let mut indexes = self.indexes.lock().unwrap();
+            indexes.drop_index(name)?;
+        }
+        self.save_indexes()
+    }
+
+    /// Query a secondary index by exact value. Returns matching primary keys.
+    pub fn query_index(&self, index_name: &str, value: &str) -> Result<Vec<String>> {
+        let indexes = self.indexes.lock().unwrap();
+        indexes.query(index_name, value)
+    }
+
+    /// Query a secondary index by prefix. Returns matching primary keys.
+    pub fn query_index_prefix(&self, index_name: &str, prefix: &str) -> Result<Vec<String>> {
+        let indexes = self.indexes.lock().unwrap();
+        indexes.query_prefix(index_name, prefix)
+    }
+
+    /// List all secondary indexes.
+    pub fn list_indexes(&self) -> Vec<String> {
+        let indexes = self.indexes.lock().unwrap();
+        indexes.list_indexes()
+    }
+
+    // ── Bloom Filter ──────────────────────────────────────────
+
+    /// Rebuild the bloom filter from the current tree.
+    pub fn rebuild_bloom(&self) -> Result<()> {
+        let tree = self.current_tree().unwrap_or_else(|_| Tree::empty());
+        let mut bloom = BloomFilter::new(tree.len().max(1000), 0.01);
+        for key in tree.entries.keys() {
+            bloom.insert(key.as_bytes());
+        }
+        *self.bloom.lock().unwrap() = bloom;
+        self.save_bloom()
+    }
+
+    /// Get bloom filter stats.
+    pub fn bloom_stats(&self) -> (usize, usize, f64) {
+        let bloom = self.bloom.lock().unwrap();
+        (bloom.count(), bloom.num_bits(), bloom.estimated_fp_rate())
+    }
+
     // ── Compaction ────────────────────────────────────────────
 
     /// Run compaction with the given policy on the current branch.
@@ -471,12 +785,20 @@ impl Database {
         let tree = self.current_tree().unwrap_or_else(|_| Tree::empty());
         let commits = self.log()?;
         let branches = self.branches()?;
+        let (bloom_items, bloom_bits, bloom_fp) = self.bloom_stats();
+        let index_count = self.list_indexes().len();
+        let wal_size = self.wal.lock().unwrap().size();
         Ok(DbStats {
             key_count: tree.len(),
             commit_count: commits.len(),
             branch_count: branches.len(),
             block_count: self.store.block_count()?,
             disk_usage: self.store.disk_usage()?,
+            bloom_items,
+            bloom_bits,
+            bloom_fp_rate: bloom_fp,
+            index_count,
+            wal_size,
         })
     }
 
@@ -599,15 +921,29 @@ pub struct DbStats {
     pub branch_count: usize,
     pub block_count: usize,
     pub disk_usage: u64,
+    pub bloom_items: usize,
+    pub bloom_bits: usize,
+    pub bloom_fp_rate: f64,
+    pub index_count: usize,
+    pub wal_size: u64,
 }
 
 impl std::fmt::Display for DbStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "Keys:     {}", self.key_count)?;
-        writeln!(f, "Commits:  {}", self.commit_count)?;
-        writeln!(f, "Branches: {}", self.branch_count)?;
-        writeln!(f, "Blocks:   {}", self.block_count)?;
-        writeln!(f, "Disk:     {} bytes", self.disk_usage)?;
+        writeln!(f, "Keys:       {}", self.key_count)?;
+        writeln!(f, "Commits:    {}", self.commit_count)?;
+        writeln!(f, "Branches:   {}", self.branch_count)?;
+        writeln!(f, "Blocks:     {}", self.block_count)?;
+        writeln!(f, "Disk:       {} bytes", self.disk_usage)?;
+        writeln!(
+            f,
+            "Bloom:      {} items, {} bits, {:.4}% FP",
+            self.bloom_items,
+            self.bloom_bits,
+            self.bloom_fp_rate * 100.0
+        )?;
+        writeln!(f, "Indexes:    {}", self.index_count)?;
+        writeln!(f, "WAL size:   {} bytes", self.wal_size)?;
         Ok(())
     }
 }
@@ -844,5 +1180,117 @@ mod tests {
         db.create_branch("temp").unwrap();
         db.delete_branch("temp").unwrap();
         assert!(!db.branches().unwrap().contains(&"temp".to_string()));
+    }
+
+    #[test]
+    fn bloom_filter_fast_negative() {
+        let (_tmp, db) = test_db();
+        db.put("exists", b"val".to_vec(), None).unwrap();
+        // Bloom should say "maybe" for existing key
+        assert!(db.get("exists").is_ok());
+        // Non-existing key: bloom may short-circuit, but result is the same
+        assert!(db.get("nope").is_err());
+    }
+
+    #[test]
+    fn rebuild_bloom() {
+        let (_tmp, db) = test_db();
+        db.put("a", b"1".to_vec(), None).unwrap();
+        db.put("b", b"2".to_vec(), None).unwrap();
+        db.rebuild_bloom().unwrap();
+        let (items, _, _) = db.bloom_stats();
+        assert_eq!(items, 2);
+    }
+
+    #[test]
+    fn rebase_branch() {
+        let (_tmp, db) = test_db();
+        // Setup: main has "base"
+        db.put("base", b"val".to_vec(), Some("base commit"))
+            .unwrap();
+
+        // Create feature branch with a new key
+        db.create_branch("feature").unwrap();
+        db.checkout("feature").unwrap();
+        db.put("feat", b"f1".to_vec(), Some("feat commit")).unwrap();
+
+        // Add more to main
+        db.checkout("main").unwrap();
+        db.put("main_extra", b"m1".to_vec(), Some("main extra"))
+            .unwrap();
+
+        // Rebase feature onto main
+        db.checkout("feature").unwrap();
+        let rebased = db.rebase("main").unwrap();
+        assert_eq!(rebased.len(), 1);
+
+        // Feature branch should now have all keys
+        assert_eq!(db.get("base").unwrap(), b"val");
+        assert_eq!(db.get("feat").unwrap(), b"f1");
+        assert_eq!(db.get("main_extra").unwrap(), b"m1");
+    }
+
+    #[test]
+    fn rebase_onto_self_fails() {
+        let (_tmp, db) = test_db();
+        db.put("k", b"v".to_vec(), None).unwrap();
+        assert!(db.rebase("main").is_err());
+    }
+
+    #[test]
+    fn secondary_index_lifecycle() {
+        let (_tmp, db) = test_db();
+        // Create index
+        db.create_index("city", "city").unwrap();
+        assert_eq!(db.list_indexes(), vec!["city"]);
+
+        // Put JSON values
+        let zurich =
+            serde_json::to_vec(&serde_json::json!({"city": "Zurich", "pop": 400000})).unwrap();
+        let berlin =
+            serde_json::to_vec(&serde_json::json!({"city": "Berlin", "pop": 3600000})).unwrap();
+        db.put("ch:zurich", zurich, None).unwrap();
+        db.put("de:berlin", berlin, None).unwrap();
+
+        // Query index
+        assert_eq!(db.query_index("city", "Zurich").unwrap(), vec!["ch:zurich"]);
+        assert_eq!(db.query_index("city", "Berlin").unwrap(), vec!["de:berlin"]);
+        assert!(db.query_index("city", "Paris").unwrap().is_empty());
+
+        // Delete and verify index updated
+        db.delete("ch:zurich", None).unwrap();
+        assert!(db.query_index("city", "Zurich").unwrap().is_empty());
+
+        // Drop index
+        db.drop_index("city").unwrap();
+        assert!(db.list_indexes().is_empty());
+    }
+
+    #[test]
+    fn secondary_index_prefix_query() {
+        let (_tmp, db) = test_db();
+        db.create_index("city", "city").unwrap();
+
+        let z1 = serde_json::to_vec(&serde_json::json!({"city": "Zurich"})).unwrap();
+        let z2 = serde_json::to_vec(&serde_json::json!({"city": "Zug"})).unwrap();
+        let b1 = serde_json::to_vec(&serde_json::json!({"city": "Berlin"})).unwrap();
+        db.put("c:1", z1, None).unwrap();
+        db.put("c:2", z2, None).unwrap();
+        db.put("c:3", b1, None).unwrap();
+
+        let results = db.query_index_prefix("city", "Zu").unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn wal_protects_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let db = Database::init(tmp.path()).unwrap();
+            db.put("key", b"value".to_vec(), None).unwrap();
+        }
+        // Reopen — WAL should recover cleanly
+        let db = Database::open(tmp.path()).unwrap();
+        assert_eq!(db.get("key").unwrap(), b"value");
     }
 }

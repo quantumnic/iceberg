@@ -1,9 +1,12 @@
 pub mod block;
+pub mod bloom;
 pub mod commit;
 pub mod compaction;
 pub mod compression;
 pub mod db;
 pub mod error;
+pub mod index;
 pub mod storage;
 pub mod tag;
 pub mod tree;
+pub mod wal;
